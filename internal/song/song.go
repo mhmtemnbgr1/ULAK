@@ -15,6 +15,7 @@ package song
 import (
 	"bufio"
 	"os"
+	"path/filepath"
 	"strconv"
 	"strings"
 
@@ -26,6 +27,7 @@ type Note struct {
 	Name    string  // gösterim için orijinal ad ("C4", "-")
 	Midi    int     // MIDI nota numarası (es ise -1)
 	Freq    float64 // 0 => es
+	Start   float64 // şarkı başından itibaren başlangıç anı (saniye)
 	Seconds float64
 }
 
@@ -34,10 +36,35 @@ type Song struct {
 	Title string
 	Tempo int // BPM
 	Notes []Note
+	Bad   int // çözülemeyen ve es sayılan nota sayısı
 }
 
-// Load bir şarkı dosyasını ayrıştırır.
+// Duration şarkının toplam süresini saniye olarak verir.
+func (s *Song) Duration() float64 {
+	var d float64
+	for _, n := range s.Notes {
+		if e := n.Start + n.Seconds; e > d {
+			d = e
+		}
+	}
+	return d
+}
+
+// Load bir şarkı dosyasını ayrıştırır; uzantıya göre .mid/.midi ya da metin.
 func Load(path string) (*Song, error) {
+	switch strings.ToLower(filepath.Ext(path)) {
+	case ".mid", ".midi":
+		data, err := os.ReadFile(path)
+		if err != nil {
+			return nil, err
+		}
+		base := filepath.Base(path)
+		return LoadMIDI(data, strings.TrimSuffix(base, filepath.Ext(base)))
+	}
+	return loadText(path)
+}
+
+func loadText(path string) (*Song, error) {
 	f, err := os.Open(path)
 	if err != nil {
 		return nil, err
@@ -64,13 +91,17 @@ func Load(path string) (*Song, error) {
 	}
 
 	beat := 60.0 / float64(s.Tempo) // bir vuruşun saniye karşılığı
+	at := 0.0
 	for _, tok := range tokens {
 		name, beats := splitToken(tok)
-		n := Note{Name: name, Midi: -1, Seconds: beats * beat}
+		n := Note{Name: name, Midi: -1, Start: at, Seconds: beats * beat}
+		at += n.Seconds
 		if name != "-" {
 			if midi, err := theory.NoteToMidi(name); err == nil {
 				n.Midi = midi
 				n.Freq = theory.MidiToFreq(midi)
+			} else {
+				s.Bad++
 			}
 		}
 		s.Notes = append(s.Notes, n)

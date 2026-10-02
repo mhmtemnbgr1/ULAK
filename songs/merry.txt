@@ -1,0 +1,6 @@
+# title: Mary Had a Little Lamb
+# tempo: 130
+E4 D4 C4 D4 E4 E4 E4:2
+D4 D4 D4:2 E4 G4 G4:2
+E4 D4 C4 D4 E4 E4 E4 E4
+D4 D4 E4 D4 C4:4

@@ -138,17 +138,14 @@ func (kb *keyboard) fitTo(s *song.Song) {
 		return
 	}
 
+	// Bir oktava ancak do'dan başlayan tek bir oktav parçayı tam kapsıyorsa
+	// sığar (ör. sol4–sol5 aralığı iki do'ya yayıldığı için sığmaz).
+	base := lo - ((lo%12)+12)%12
 	span := spanOctave
-	if hi-lo > spanOctave {
+	if hi > base+spanOctave {
 		span = spanFull
 	}
-	// Aralığı ortalayan do'yu seç, sonra parçayı içeri alacak şekilde kaydır.
-	base := (lo+hi)/2 - span/2
-	base -= ((base%12)+12)%12
-	for base > lo {
-		base -= 12
-	}
-	for base+span < hi {
+	for base+span < hi { // çok geniş parçalarda üst notaları da içeri al
 		base += 12
 	}
 	kb.setRange(clampInt(base, 24, 108-span), span)

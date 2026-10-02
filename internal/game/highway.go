@@ -106,6 +106,7 @@ type highway struct {
 
 	tiles []tile
 	stats stats
+	total float64 // şarkının bitiş anı (saniye)
 
 	lastGrade grade
 	pulse     float64 // isabet hattının parlama miktarı
@@ -121,20 +122,20 @@ func (hw *highway) load(s *song.Song, kb *keyboard) {
 	hw.tiles = hw.tiles[:0]
 	hw.stats = stats{}
 	hw.lastGrade = gradeNone
+	defer func() { hw.total = hw.duration() }()
 
-	t := 0.0
 	for _, n := range s.Notes {
-		if n.Midi >= 0 {
-			if idx := kb.indexOfMidi(n.Midi); idx >= 0 {
-				hw.tiles = append(hw.tiles, tile{
-					keyIdx: idx,
-					freq:   n.Freq,
-					start:  t,
-					dur:    n.Seconds,
-				})
-			}
+		if n.Midi < 0 {
+			continue
 		}
-		t += n.Seconds
+		if idx := kb.indexOfMidi(n.Midi); idx >= 0 {
+			hw.tiles = append(hw.tiles, tile{
+				keyIdx: idx,
+				freq:   n.Freq,
+				start:  n.Start,
+				dur:    n.Seconds,
+			})
+		}
 	}
 }
 
@@ -313,11 +314,19 @@ func (hw *highway) drawTiles(screen *ebiten.Image, kb *keyboard, now float64) {
 		// Üst kenarda parlak bir çizgi: bloğa hacim verir.
 		fillRounded(dst, x+6, y+3, w-12, 3, 1.5, alpha(colNeonSoft, 0.75))
 
+		// Notanın basılacağı bilgisayar tuşu: kısa notada ortada, uzunda üstte.
+		lblSize := clamp(float64(w)*0.34, 12, 26)
+		lblY := float64(y + h/2)
+		if h > 92 {
+			lblY = float64(y) + 8 + lblSize*0.8
+		}
+		drawText(dst, k.label, face(lblSize, true), float64(x+w/2), lblY, alpha(colWhite, 0.92), text.AlignCenter)
+
 		// Uzun notalarda referanstaki beyaz çizgi + halka göstergesi.
 		if h > 92 {
 			cx := float64(x + w/2)
 			ringY := float64(y+h) - 26
-			topY := float64(y) + 18
+			topY := lblY + lblSize*0.8
 			drawVLine(dst, cx, topY, ringY-12, 3, alpha(colWhite, 0.92))
 			strokeCircle(dst, float32(cx), float32(ringY), float32(w)*0.19, 3, alpha(colWhite, 0.92))
 			drawGlow(dst, cx, ringY, float64(w)*0.5, colNeonSoft, 0.35)

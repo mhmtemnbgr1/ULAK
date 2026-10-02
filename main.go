@@ -4,6 +4,7 @@
 package main
 
 import (
+	"flag"
 	"fmt"
 	"os"
 
@@ -14,6 +15,9 @@ import (
 )
 
 func main() {
+	docs := flag.String("docs", "", "README görsellerini bu klasöre üretip çık")
+	flag.Parse()
+
 	if err := audio.Init(); err != nil {
 		fmt.Fprintln(os.Stderr, "Ses başlatılamadı:", err)
 		os.Exit(1)
@@ -24,7 +28,16 @@ func main() {
 	ebiten.SetWindowResizingMode(ebiten.WindowResizingModeEnabled)
 	ebiten.SetVsyncEnabled(true)
 
-	if err := ebiten.RunGame(game.New("songs")); err != nil {
+	var run ebiten.Game = game.New(game.FindSongsDir())
+	if *docs != "" {
+		sr, err := game.NewShotRunner(run.(*game.Game), *docs)
+		if err != nil {
+			fmt.Fprintln(os.Stderr, "Hata:", err)
+			os.Exit(1)
+		}
+		run = sr
+	}
+	if err := ebiten.RunGame(run); err != nil {
 		fmt.Fprintln(os.Stderr, "Hata:", err)
 		os.Exit(1)
 	}

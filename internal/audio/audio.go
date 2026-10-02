@@ -15,7 +15,24 @@ const sampleRate beep.SampleRate = 44100
 var (
 	initOnce sync.Once
 	mixer    = &beep.Mixer{}
+	volume   = 1.0 // 0..1.5, speaker kilidi altında okunur/yazılır
 )
+
+// SetVolume ana ses seviyesini ayarlar (0..1.5) ve uygulanan değeri döndürür.
+func SetVolume(v float64) float64 {
+	v = math.Max(0, math.Min(1.5, v))
+	speaker.Lock()
+	volume = v
+	speaker.Unlock()
+	return v
+}
+
+// Volume geçerli ana ses seviyesini verir.
+func Volume() float64 {
+	speaker.Lock()
+	defer speaker.Unlock()
+	return volume
+}
 
 // Init hoparlörü açar. Program başında bir kez çağrılmalı.
 func Init() error {
@@ -73,7 +90,8 @@ func (t *tone) Stream(samples [][2]float64) (n int, ok bool) {
 			0.5*math.Sin(2*ph) +
 			0.25*math.Sin(3*ph) +
 			0.12*math.Sin(4*ph)
-		v *= env * 0.18 // genel ses seviyesi (kırpılmayı önler)
+		v *= env * 0.18 * volume // genel ses seviyesi (kırpılmayı önler)
+		v = math.Tanh(v * 1.4) / 1.4 // çok sayıda nota üst üste binince yumuşak sınırla
 
 		samples[i][0] = v
 		samples[i][1] = v

@@ -3,10 +3,14 @@ package game
 import (
 	"fmt"
 	"image/color"
+	"io/fs"
 	"math"
+	"os"
 	"path/filepath"
 	"sort"
 	"strconv"
+	"strings"
+	"time"
 
 	"github.com/hajimehoshi/ebiten/v2"
 	"github.com/hajimehoshi/ebiten/v2/inpututil"
@@ -34,11 +38,40 @@ const (
 
 // entry seçim ekranındaki bir şarkı satırıdır.
 type entry struct {
-	path  string
-	title string
-	tempo int
-	notes int
-	best  int // bu oturumdaki en iyi skor
+	path   string
+	title  string
+	tempo  int
+	notes  int
+	length float64 // saniye
+	stars  int     // 1..5 zorluk
+	bad    int     // çözülemeyen nota sayısı
+	broken bool    // dosya okunamadı
+	best   int     // en iyi skor (diske kaydedilir)
+}
+
+// difficulty şarkının nota yoğunluğundan 1..5 arası zorluk çıkarır.
+func difficulty(s *song.Song) int {
+	d := s.Duration()
+	if d <= 0 {
+		return 1
+	}
+	nps := float64(len(s.Notes)) / d
+	return int(clamp(float64(1+int(nps/1.2)), 1, 5))
+}
+
+// FindSongsDir şarkı klasörünü bulur: önce çalışma klasörüne, sonra
+// çalıştırılabilir dosyanın yanına bakar. Böylece exe başka yerden de açılabilir.
+func FindSongsDir() string {
+	if st, err := os.Stat("songs"); err == nil && st.IsDir() {
+		return "songs"
+	}
+	if exe, err := os.Executable(); err == nil {
+		dir := filepath.Join(filepath.Dir(exe), "songs")
+		if st, err := os.Stat(dir); err == nil && st.IsDir() {
+			return dir
+		}
+	}
+	return "songs"
 }
 
 // Game Ebitengine'in çalıştırdığı ana nesnedir.
@@ -52,7 +85,8 @@ type Game struct {
 	state   state
 	entries []entry
 	sel     int
-	scroll  float64
+	scroll  float64 // görünen kaydırma (satır cinsinden, yumuşatılmış)
+	scrollTarget float64
 
 	cur    *song.Song
 	now    float64 // şarkı zamanı; negatifken geri sayım sürer
@@ -60,8 +94,81 @@ type Game struct {
 	auto   bool
 	result stats
 
+	resultAuto bool // sonuç otomatik çalmayla alındı
+	newBest    bool // sonuç yeni rekor
+
+	save     saveData // kalıcı skorlar ve gecikme ayarı
+	songsDir string
+	lastTick time.Time
+
+	notice  string // kısa süre görünen bilgi mesajı
+	noticeT float64
+	lastNote  string // son çalınan notanın adı
+	lastNoteT float64
+
+	canvas *ebiten.Image // ekran sarsıntısı için ara tuval
+
 	clock        float64 // toplam süre (arka plan animasyonları için)
 	windowFitted bool
+}
+
+func (g *Game) offset() float64 { return float64(g.save.OffsetMs) / 1000 }
+
+func (g *Game) adjustOffset(deltaMs int) {
+	g.save.OffsetMs = clampInt(g.save.OffsetMs+deltaMs, -300, 300)
+	writeSave(g.save)
+	g.tell(fmt.Sprintf("Gecikme ayarı %+d ms", g.save.OffsetMs))
+}
+
+// importDropped pencereye sürüklenen .mid/.txt dosyalarını şarkı klasörüne
+// kopyalar ve listeyi yeniler.
+func (g *Game) importDropped() {
+	d := ebiten.DroppedFiles()
+	if d == nil || g.state == statePlay {
+		return
+	}
+	if err := os.MkdirAll(g.songsDir, 0o755); err != nil {
+		g.tell("Şarkı klasörü oluşturulamadı")
+		return
+	}
+	var added []string
+	_ = fs.WalkDir(d, ".", func(p string, de fs.DirEntry, err error) error {
+		if err != nil || de.IsDir() {
+			return nil
+		}
+		switch strings.ToLower(filepath.Ext(p)) {
+		case ".mid", ".midi", ".txt":
+		default:
+			return nil
+		}
+		data, err := fs.ReadFile(d, p)
+		if err != nil {
+			return nil
+		}
+		dst := filepath.Join(g.songsDir, filepath.Base(p))
+		if err := os.WriteFile(dst, data, 0o644); err == nil {
+			added = append(added, filepath.Base(p))
+		}
+		return nil
+	})
+	if len(added) == 0 {
+		g.tell("Desteklenen dosya yok (.mid, .txt)")
+		return
+	}
+	g.entries = discover(g.songsDir, g.save.Scores)
+	for i, e := range g.entries {
+		if filepath.Base(e.path) == added[len(added)-1] {
+			g.sel = i
+		}
+	}
+	g.state = stateSelect
+	g.kb.setRange(60, spanFull)
+	g.tell(fmt.Sprintf("%d şarkı eklendi", len(added)))
+}
+
+// tell ekranın üstünde kısa bir bilgi mesajı gösterir.
+func (g *Game) tell(msg string) {
+	g.notice, g.noticeT = msg, 2.6
 }
 
 // New şarkı klasörünü tarayarak oyunu hazırlar.
@@ -72,7 +179,9 @@ func New(songsDir string) *Game {
 		fx:    newEffects(),
 		state: stateFree,
 	}
-	g.entries = discover(songsDir)
+	g.save = loadSave()
+	g.songsDir = songsDir
+	g.entries = discover(songsDir, g.save.Scores)
 	// İlk karede girdi gelirse efektlerin doğru yerde doğması için başlangıç
 	// yerleşimini şimdiden hesapla.
 	g.w, g.h = WindowW, WindowH
@@ -80,18 +189,27 @@ func New(songsDir string) *Game {
 	return g
 }
 
-// discover klasördeki .txt şarkılarını okur ve başlıklarıyla listeler.
-func discover(dir string) []entry {
-	matches, _ := filepath.Glob(filepath.Join(dir, "*.txt"))
+// discover klasördeki .txt ve .mid şarkılarını okur ve başlıklarıyla listeler.
+func discover(dir string, scores map[string]int) []entry {
+	var matches []string
+	for _, pat := range []string{"*.txt", "*.mid", "*.midi"} {
+		m, _ := filepath.Glob(filepath.Join(dir, pat))
+		matches = append(matches, m...)
+	}
 	sort.Strings(matches)
 
 	var out []entry
 	for _, path := range matches {
-		e := entry{path: path, title: filepath.Base(path)}
+		e := entry{path: path, title: filepath.Base(path), best: scores[filepath.Base(path)]}
 		if s, err := song.Load(path); err == nil {
 			e.title = s.Title
 			e.tempo = s.Tempo
 			e.notes = len(s.Notes)
+			e.length = s.Duration()
+			e.stars = difficulty(s)
+			e.bad = s.Bad
+		} else {
+			e.broken = true
 		}
 		out = append(out, e)
 	}
@@ -131,10 +249,20 @@ func (g *Game) fitWindowOnce() {
 }
 
 func (g *Game) Update() error {
-	const dt = 1.0 / 60.0
+	// Gerçek geçen süre: sabit 1/60 varsaymak kare düşünce notaların müzikten
+	// kaymasına yol açıyordu. Uzun takılmalar (pencere sürükleme) kırpılır.
+	now := time.Now()
+	dt := 1.0 / 60.0
+	if !g.lastTick.IsZero() {
+		dt = clamp(now.Sub(g.lastTick).Seconds(), 0.001, 0.05)
+	}
+	g.lastTick = now
 	g.clock += dt
 	g.fitWindowOnce()
 
+	g.importDropped()
+	g.noticeT -= dt
+	g.lastNoteT -= dt
 	g.kb.update(dt)
 	g.fx.update(dt)
 
@@ -184,12 +312,34 @@ func (g *Game) handleGlobalKeys() error {
 		}
 	}
 
-	// Oktav kaydırma her modda çalışır. Ok tuşları hiçbir notaya bağlı değil.
-	if inpututil.IsKeyJustPressed(ebiten.KeyArrowLeft) {
-		g.kb.shiftOctave(-1)
+	// Oktav kaydırma yalnız şarkı dışında çalışır: şarkı sırasında klavye
+	// aralığı notalara sabitlenmiştir, kaydırmak sesleri yanlış perdeye taşırdı.
+	if g.state == stateFree {
+		if inpututil.IsKeyJustPressed(ebiten.KeyArrowLeft) {
+			g.kb.shiftOctave(-1)
+		}
+		if inpututil.IsKeyJustPressed(ebiten.KeyArrowRight) {
+			g.kb.shiftOctave(1)
+		}
 	}
-	if inpututil.IsKeyJustPressed(ebiten.KeyArrowRight) {
-		g.kb.shiftOctave(1)
+
+	// Giriş gecikmesi telafisi: nota hattan önce/sonra geliyormuş gibi
+	// hissediliyorsa [ ve ] ile 10 ms'lik adımlarla ayarlanır.
+	if inpututil.IsKeyJustPressed(ebiten.KeyBracketLeft) {
+		g.adjustOffset(-10)
+	}
+	if inpututil.IsKeyJustPressed(ebiten.KeyBracketRight) {
+		g.adjustOffset(10)
+	}
+
+	if inpututil.IsKeyJustPressed(ebiten.KeyF11) {
+		ebiten.SetFullscreen(!ebiten.IsFullscreen())
+	}
+	if inpututil.IsKeyJustPressed(ebiten.KeyMinus) || inpututil.IsKeyJustPressed(ebiten.KeyNumpadSubtract) {
+		g.tell(fmt.Sprintf("Ses %d%%", int(math.Round(audio.SetVolume(audio.Volume()-0.1)*100))))
+	}
+	if inpututil.IsKeyJustPressed(ebiten.KeyEqual) || inpututil.IsKeyJustPressed(ebiten.KeyNumpadAdd) {
+		g.tell(fmt.Sprintf("Ses %d%%", int(math.Round(audio.SetVolume(audio.Volume()+0.1)*100))))
 	}
 
 	if inpututil.IsKeyJustPressed(ebiten.KeyF) && (g.state == statePlay || g.state == stateSelect) {
@@ -219,6 +369,7 @@ func (g *Game) handlePianoKeys() {
 func (g *Game) playKey(i int) {
 	freq := theory.MidiToFreq(g.kb.midiAt(i))
 	audio.Play(freq, 1.8)
+	g.lastNote, g.lastNoteT = noteName(g.kb.midiAt(i)), 1.6
 
 	cx := g.kb.centerOf(i)
 	line := g.hw.lineY()
@@ -226,7 +377,7 @@ func (g *Game) playKey(i int) {
 	switch g.state {
 	case statePlay:
 		if !g.paused && g.now >= -winGood {
-			if idx, ok := g.hw.press(i, g.now); ok {
+			if idx, ok := g.hw.press(i, g.now-g.offset()); ok {
 				t := g.hw.tiles[idx]
 				g.fx.burst(cx, line, t.grade.color(), 1.0)
 				g.fx.say(cx, line-70, t.grade.label(), t.grade.color())
@@ -248,27 +399,14 @@ func (g *Game) playKey(i int) {
 
 // ------------------------------------------------------------- şarkı seçimi
 
-func (g *Game) updateSelect() {
+func (g *Game) startSong() {
 	if len(g.entries) == 0 {
 		return
 	}
-	if inpututil.IsKeyJustPressed(ebiten.KeyArrowDown) {
-		g.sel = (g.sel + 1) % len(g.entries)
-	}
-	if inpututil.IsKeyJustPressed(ebiten.KeyArrowUp) {
-		g.sel = (g.sel - 1 + len(g.entries)) % len(g.entries)
-	}
-	if inpututil.IsKeyJustPressed(ebiten.KeyEnter) || inpututil.IsKeyJustPressed(ebiten.KeyNumpadEnter) {
-		g.startSong()
-	}
-
-	// Seçili satırı yumuşakça takip et.
-	g.scroll += (float64(g.sel) - g.scroll) * 0.18
-}
-
-func (g *Game) startSong() {
 	s, err := song.Load(g.entries[g.sel].path)
 	if err != nil {
+		g.state = stateSelect
+		g.tell("Şarkı açılamadı: " + filepath.Base(g.entries[g.sel].path))
 		return
 	}
 	g.cur = s
@@ -316,8 +454,15 @@ func (g *Game) updatePlay(dt float64) {
 
 	if g.hw.finished(g.now) {
 		g.result = g.hw.stats
-		if g.result.score > g.entries[g.sel].best {
-			g.entries[g.sel].best = g.result.score
+		g.resultAuto = g.auto
+		// Otomatik çalma skoru rekor sayılmaz.
+		if e := &g.entries[g.sel]; !g.auto && g.result.score > e.best {
+			e.best = g.result.score
+			g.newBest = true
+			g.save.Scores[filepath.Base(e.path)] = e.best
+			writeSave(g.save)
+		} else {
+			g.newBest = false
 		}
 		g.state = stateResult
 	}
@@ -330,6 +475,23 @@ func (g *Game) Draw(screen *ebiten.Image) {
 	g.h = float64(screen.Bounds().Dy())
 	g.relayout()
 
+	dx, dy := g.fx.offset()
+	if dx == 0 && dy == 0 {
+		g.drawScene(screen)
+		return
+	}
+	// Sarsıntı: sahneyi ara tuvale çizip kaydırarak ekrana bas.
+	if g.canvas == nil || g.canvas.Bounds().Size() != screen.Bounds().Size() {
+		g.canvas = ebiten.NewImage(screen.Bounds().Dx(), screen.Bounds().Dy())
+	}
+	g.canvas.Clear()
+	g.drawScene(g.canvas)
+	op := &ebiten.DrawImageOptions{}
+	op.GeoM.Translate(dx, dy)
+	screen.DrawImage(g.canvas, op)
+}
+
+func (g *Game) drawScene(screen *ebiten.Image) {
 	g.drawBackground(screen)
 	g.fx.drawBokeh(screen, g.w, g.h)
 
@@ -362,6 +524,7 @@ func (g *Game) Draw(screen *ebiten.Image) {
 	if g.state == stateResult {
 		g.drawResult(screen)
 	}
+	g.drawNotice(screen)
 }
 
 // relayout pencere boyutuna göre alanları yeniden hesaplar.
@@ -395,17 +558,24 @@ func (g *Game) drawHeader(screen *ebiten.Image) {
 	switch g.state {
 	case stateFree:
 		drawTextGlow(screen, "SERBEST ÇALMA", face(30, true), pad, y, colWhite, text.AlignStart)
-		g.drawHint(screen, "TAB şarkılar   ← → oktav   ESC çıkış", pad, y+26)
+		g.drawHint(screen, pad, y+26, g.w-2*pad,
+			"TAB şarkılar   ← → oktav   - + ses   F11 tam ekran   ESC çıkış",
+			"TAB şarkılar   ← → oktav   ESC çıkış")
 	case stateSelect:
 		drawTextGlow(screen, "ŞARKI SEÇ", face(30, true), pad, y, colWhite, text.AlignStart)
-		g.drawHint(screen, "↑ ↓ seç   ENTER başlat   F otomatik   TAB serbest çalma", pad, y+26)
+		g.drawHint(screen, pad, y+26, g.w-2*pad,
+			"← → ↑ ↓ seç   ENTER başlat   F otomatik   [ ] gecikme   TAB serbest   ESC geri",
+			"← → ↑ ↓ seç   ENTER başlat   TAB serbest")
 	case statePlay, stateResult:
 		title := "—"
 		if g.cur != nil {
 			title = g.cur.Title
 		}
 		drawTextGlow(screen, title, face(28, true), pad, y, colWhite, text.AlignStart)
-		g.drawHint(screen, "BOŞLUK duraklat   F5 baştan   F otomatik   ESC listeye dön", pad, y+26)
+		// Sağ üstteki skor alanına çarpmamak için ipucuna kalan genişlik verilir.
+		g.drawHint(screen, pad, y+26, g.w-2*pad-230,
+			"BOŞLUK duraklat   F5 baştan   F otomatik   ESC listeye dön",
+			"BOŞLUK duraklat   F5 baştan   ESC geri")
 	}
 
 	// Sağ üst: skor ve isabet oranı (yalnız şarkı modunda).
@@ -416,13 +586,52 @@ func (g *Game) drawHeader(screen *ebiten.Image) {
 			face(17, false), g.w-pad, y+26, alpha(colWhite, 0.85), text.AlignEnd)
 	}
 
-	if g.auto {
+	if g.auto && g.state != stateFree {
 		drawText(screen, "OTOMATİK", face(16, true), g.w/2, 26, alpha(colGood, 0.95), text.AlignCenter)
+	}
+
+	if g.state == statePlay && g.cur != nil {
+		g.drawProgress(screen)
 	}
 }
 
-func (g *Game) drawHint(screen *ebiten.Image, s string, x, y float64) {
-	drawText(screen, s, face(17, false), x, y, alpha(colWhite, 0.82), text.AlignStart)
+// drawProgress pencerenin en üstüne ince bir şarkı ilerleme çubuğu çizer.
+func (g *Game) drawProgress(screen *ebiten.Image) {
+	x, w, y := 0.0, g.w, 0.0
+	frac := 0.0
+	if g.hw.total > 0 {
+		frac = clamp(g.now/g.hw.total, 0, 1)
+	}
+	fillRounded(screen, float32(x), float32(y), float32(w), 5, 0, alpha(colWhite, 0.18))
+	if frac > 0 {
+		fillRounded(screen, float32(x), float32(y), float32(w*frac), 5, 0, colNeon)
+		drawGlow(screen, x+w*frac, y+2, 16, colNeon, 0.6)
+	}
+}
+
+// drawHint ipucu satırını çizer; uzun sürüm sığmazsa kısa sürüme düşer.
+func (g *Game) drawHint(screen *ebiten.Image, x, y, maxW float64, long, short string) {
+	f := face(17, false)
+	s := long
+	if w, _ := text.Measure(s, f, 0); w > maxW {
+		s = short
+	}
+	drawText(screen, s, f, x, y, alpha(colWhite, 0.82), text.AlignStart)
+}
+
+// drawNotice ses ayarı gibi kısa bilgi mesajlarını üst ortada gösterir.
+func (g *Game) drawNotice(screen *ebiten.Image) {
+	if g.noticeT <= 0 || g.notice == "" {
+		return
+	}
+	a := clamp(g.noticeT*2, 0, 1)
+	f := face(20, true)
+	tw, _ := text.Measure(g.notice, f, 0)
+	w, h := tw+44, 40.0
+	x, y := g.w/2-w/2, g.hw.y+10
+	fillRounded(screen, float32(x), float32(y), float32(w), float32(h), 20, alpha(colLane, 0.92*a))
+	strokeRounded(screen, float32(x), float32(y), float32(w), float32(h), 20, 1.5, alpha(colNeon, 0.8*a))
+	drawText(screen, g.notice, f, g.w/2, y+h/2, alpha(colWhite, a), text.AlignCenter)
 }
 
 // drawFreeHint serbest modda şeritlerin ortasında yumuşak bir yönlendirme.
@@ -438,66 +647,18 @@ func (g *Game) drawFreeHint(screen *ebiten.Image) {
 		face(20, false), cx, cy+82, alpha(colWhite, 0.7), text.AlignCenter)
 	drawText(screen, "TAB ile şarkı listesine geç",
 		face(19, false), cx, cy+124, alpha(colNeonSoft, 0.9), text.AlignCenter)
+
+	// Son çalınan notanın adı: yumuşakça sönen büyük bir gösterge.
+	if g.lastNoteT > 0 && g.lastNote != "" {
+		a := clamp(g.lastNoteT*1.2, 0, 1)
+		drawTextGlow(screen, g.lastNote, face(84, true), cx, cy-110, alpha(colNeon, a), text.AlignCenter)
+	}
 }
 
-// drawSelect şarkı listesini kart kart çizer.
-func (g *Game) drawSelect(screen *ebiten.Image) {
-	if len(g.entries) == 0 {
-		drawText(screen, "songs/ klasöründe .txt şarkı bulunamadı", face(24, true),
-			g.hw.x+g.hw.w/2, g.hw.y+g.hw.h/2, colWhite, text.AlignCenter)
-		return
-	}
-
-	cardW := clamp(g.hw.w*0.62, 420, 760)
-	cardH := 82.0
-	gap := 14.0
-	cx := g.hw.x + g.hw.w/2
-	// Seçili kart alanın ortasında dursun.
-	cy := g.hw.y + g.hw.h/2
-
-	for i, e := range g.entries {
-		dy := (float64(i) - g.scroll) * (cardH + gap)
-		y := cy + dy
-		if y < g.hw.y-cardH || y > g.hw.y+g.hw.h+cardH {
-			continue
-		}
-
-		selected := i == g.sel
-		// Merkezden uzaklaştıkça kartlar söner; alan kenarına varmadan
-		// kaybolsunlar ki klavyenin arkasında sert kesilmesinler.
-		fade := clamp(1-math.Abs(dy)/(g.hw.h*0.40), 0, 1)
-		if fade <= 0.02 {
-			continue
-		}
-
-		x := cx - cardW/2
-		top := y - cardH/2
-
-		bg := alpha(colLane, 0.85*fade)
-		if selected {
-			bg = alpha(rgb(0x14265E), 0.95)
-		}
-		fillRounded(screen, float32(x), float32(top), float32(cardW), float32(cardH), 16, bg)
-
-		if selected {
-			strokeRounded(screen, float32(x), float32(top), float32(cardW), float32(cardH), 16, 2.5, colNeon)
-			drawGlow(screen, cx, y, cardW*0.55, colNeon, 0.22)
-		} else {
-			strokeRounded(screen, float32(x), float32(top), float32(cardW), float32(cardH), 16, 1.5,
-				alpha(colNeonSoft, 0.25*fade))
-		}
-
-		drawText(screen, e.title, face(26, true), x+26, y-12, alpha(colWhite, fade), text.AlignStart)
-		info := fmt.Sprintf("%d nota · %d BPM", e.notes, e.tempo)
-		if e.best > 0 {
-			info += fmt.Sprintf("   ·   en iyi %d", e.best)
-		}
-		drawText(screen, info, face(17, false), x+26, y+18, alpha(colNeonSoft, 0.85*fade), text.AlignStart)
-
-		if selected {
-			drawText(screen, "ENTER", face(20, true), x+cardW-26, y, colNeon, text.AlignEnd)
-		}
-	}
+// fmtDuration saniyeyi "1:05" biçimine çevirir.
+func fmtDuration(sec float64) string {
+	n := int(math.Round(sec))
+	return fmt.Sprintf("%d:%02d", n/60, n%60)
 }
 
 func (g *Game) drawCountdown(screen *ebiten.Image) {
@@ -526,17 +687,31 @@ func (g *Game) drawPaused(screen *ebiten.Image) {
 }
 
 func (g *Game) drawResult(screen *ebiten.Image) {
+	// Küçük pencerelerde kart başlığa taşmasın diye ölçeklenir.
+	sc := clamp(math.Min((g.hw.h-10)/420, (g.w-40)/520), 0.55, 1)
 	cx := g.w / 2
-	cy := g.h*0.42 - 20
-	w, h := 520.0, 380.0
+	cy := g.hw.y + g.hw.h*0.5
+	w, h := 520.0*sc, 420.0*sc
+	top := cy - h/2
+	f := func(size float64, bold bool) text.Face { return face(size*sc, bold) }
 
-	fillRounded(screen, float32(cx-w/2), float32(cy-h/2), float32(w), float32(h), 26, alpha(colLane, 0.94))
-	strokeRounded(screen, float32(cx-w/2), float32(cy-h/2), float32(w), float32(h), 26, 2.5, alpha(colNeon, 0.9))
+	// Arkadaki şerit ve notaları karart; kart öne çıksın.
+	fillRounded(screen, float32(g.hw.x), float32(g.hw.y), float32(g.hw.w), float32(g.hw.h), 4, alpha(colInk, 0.55))
+	fillRounded(screen, float32(cx-w/2), float32(top), float32(w), float32(h), 26, alpha(colLane, 0.97))
+	strokeRounded(screen, float32(cx-w/2), float32(top), float32(w), float32(h), 26, 2.5, alpha(colNeon, 0.9))
 
 	rank, rankColor := g.result.rank()
-	drawText(screen, "SONUÇ", face(20, true), cx, cy-h/2+38, alpha(colWhite, 0.7), text.AlignCenter)
-	drawTextGlow(screen, rank, face(110, true), cx, cy-h/2+124, rankColor, text.AlignCenter)
-	drawTextGlow(screen, fmt.Sprintf("%d", g.result.score), face(46, true), cx, cy-h/2+196, colWhite, text.AlignCenter)
+	drawText(screen, "SONUÇ", f(20, true), cx, top+36*sc, alpha(colWhite, 0.7), text.AlignCenter)
+	drawTextGlow(screen, rank, f(96, true), cx, top+112*sc, rankColor, text.AlignCenter)
+	drawTextGlow(screen, fmt.Sprintf("%d", g.result.score), f(46, true), cx, top+200*sc, colWhite, text.AlignCenter)
+
+	switch {
+	case g.newBest:
+		drawText(screen, "YENİ REKOR!", f(18, true), cx, top+238*sc, colGood, text.AlignCenter)
+	case g.resultAuto:
+		drawText(screen, "Otomatik çalma — rekor sayılmaz", f(16, false), cx, top+238*sc,
+			alpha(colWhite, 0.6), text.AlignCenter)
+	}
 
 	rows := []struct {
 		label string
@@ -549,13 +724,13 @@ func (g *Game) drawResult(screen *ebiten.Image) {
 		{"En iyi kombo", g.result.maxCombo, colNeonSoft},
 	}
 
-	y := cy - h/2 + 244
+	y := top + 276*sc
 	for _, r := range rows {
-		drawText(screen, r.label, face(19, false), cx-w/2+40, y, alpha(colWhite, 0.85), text.AlignStart)
-		drawText(screen, strconv.Itoa(r.value), face(19, true), cx+w/2-40, y, r.clr, text.AlignEnd)
-		y += 28
+		drawText(screen, r.label, f(19, false), cx-w/2+40*sc, y, alpha(colWhite, 0.85), text.AlignStart)
+		drawText(screen, strconv.Itoa(r.value), f(19, true), cx+w/2-40*sc, y, r.clr, text.AlignEnd)
+		y += 28 * sc
 	}
 
-	drawText(screen, "F5 baştan   ·   ESC listeye dön", face(18, false), cx, cy+h/2-26,
+	drawText(screen, "F5 baştan   ·   ESC listeye dön", f(18, false), cx, top+h-24*sc,
 		alpha(colNeonSoft, 0.9), text.AlignCenter)
 }
